@@ -1,0 +1,107 @@
+name: Flake probe (test-examples)
+
+on:
+  push:
+    branches: ["flake-probe*"]
+  workflow_dispatch:
+
+# 排他制御はしない。押し直しても走行中の run を殺さず、同じ sha への
+# workflow_dispatch も待たされずに走る（試行回数を稼ぐのが目的なので)。
+
+permissions:
+  contents: read
+
+jobs:
+  e2e-tools:
+    name: E2E Tools
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.26"
+          cache: true
+      - run: |
+          make k3d tilt
+          mkdir -p tools-bin
+          cp "$(go env GOPATH)/bin/k3d" "$(go env GOPATH)/bin/tilt" tools-bin/
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-tools
+          path: tools-bin
+          if-no-files-found: error
+
+  probe:
+    # name: を明示するとマトリクス値が自動で付かないので、自分で埋める
+    name: probe ${{ matrix.run }}
+    needs: [e2e-tools]
+    runs-on: ubuntu-24.04
+    # 最悪ケース: setup 3m + tilt 15m + E2E_SUITE_TIMEOUT 20m x 3
+    timeout-minutes: 75
+    env:
+      KUBECONFIG: /home/runner/.kube/config
+      E2E_ENV_FACTOR: 2
+    strategy:
+      fail-fast: false
+      matrix:
+        run: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.26"
+          cache: true
+      - name: Set up k3d cluster and E2E tooling
+        uses: ./.github/actions/e2e-cluster-up
+        with:
+          k8s-version: max
+          cli-auth-kubeconfig: "true"
+      - name: Build images and start Argo in-cluster
+        run: |
+          tilt up --stream -- --mode=ci --profile=minimal \
+            --api=false --secure=false --auth-mode=client \
+            --initless=false --pod-status-capture-finalizer=true > /tmp/tilt.log 2>&1 &
+          until tilt get uiresource workflow-controller >/dev/null 2>&1; do
+            echo "waiting for Tilt to load..."; sleep 2
+          done
+          until tilt wait --for=condition=Ready uiresource --all --timeout=15s 2>/dev/null; do
+            echo "waiting for Tilt resources to become ready..."; sleep 5
+          done
+        timeout-minutes: 15
+
+      # クラスタ構築は 1 回、スイートは 3 回まわす（試行回数を稼ぐ）
+      - name: Run test-examples x3
+        run: |
+          for i in 1 2 3; do
+            echo "::group::attempt $i"
+            GOFLAGS=-count=1 make test-examples \
+              E2E_SUITE_TIMEOUT=20m \
+              E2E_WAIT_TIMEOUT=180s \
+              STATIC_FILES=false \
+              INITLESS=false \
+              TEST_RETRIES=0
+            echo "::endgroup::"
+          done
+
+      # 成功時も失敗時も必ず pod ログを取る（成功時の基準値が欲しい）
+      - name: Dump workflow pod logs
+        if: ${{ always() }}
+        run: |
+          kubectl get pod -l workflows.argoproj.io/workflow -o wide || true
+          for pod in $(kubectl get pod -l workflows.argoproj.io/workflow -o name); do
+            # `|| true`: pod は走行中に GC されうる。代入内の command substitution が
+            # 失敗すると `set -e` でステップごと死ぬ（直そうとしているバグの再発）
+            ctrs=$(kubectl get "$pod" -o jsonpath='{range .spec.initContainers[*]}{.name}{"\n"}{end}{range .spec.containers[*]}{.name}{"\n"}{end}' 2>/dev/null || true)
+            for c in $ctrs; do
+              echo "::group::$pod / $c"
+              kubectl logs "$pod" -c "$c" --tail=-1 2>&1 || true
+              echo "::endgroup::"
+            done
+          done
+      - name: Describe on failure
+        if: ${{ failure() }}
+        run: |
+          kubectl get wf -o wide || true
+          kubectl describe wf || true
+          kubectl describe pod -l workflows.argoproj.io/workflow || true

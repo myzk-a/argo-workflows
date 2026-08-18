@@ -8,3 +8,4 @@ spec:
       containers:
         - name: workflow-controller
           imagePullPolicy: Never
+          args: ["--loglevel=debug"]
