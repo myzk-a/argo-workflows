@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"time"
 
 	"github.com/argoproj/pkg/stats"
 	"github.com/spf13/cobra"
@@ -56,6 +57,7 @@ func NewArtifactPluginInitCommand() *cobra.Command {
 }
 
 func loadArtifactPlugin(ctx context.Context, pluginName wfv1.ArtifactPluginName) error {
+	time.Sleep(500 * time.Millisecond) // TEMPORARY: force the race
 	if err := os.MkdirAll(pluginName.SocketDir(), 0755); err != nil {
 		return err
 	}
